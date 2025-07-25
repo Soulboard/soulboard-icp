@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "src/soulboard-icp-backend"
+]
+resolver = "2"

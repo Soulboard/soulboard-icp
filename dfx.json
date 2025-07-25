@@ -1,0 +1,27 @@
+{
+  "canisters": {
+    "soulboard-icp-backend": {
+      "candid": "src/soulboard-icp-backend/soulboard-icp-backend.did",
+      "package": "soulboard-icp-backend",
+      "type": "rust"
+    },
+    "soulboard-icp-frontend": {
+      "dependencies": [
+        "soulboard-icp-backend"
+      ],
+      "source": [
+        "src/soulboard-icp-frontend/dist"
+      ],
+      "type": "assets",
+      "workspace": "soulboard-icp-frontend"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
