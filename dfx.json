@@ -5,6 +5,12 @@
       "package": "soulboard-icp-backend",
       "type": "rust"
     },
+    "sol_rpc": {
+      "type": "custom",
+      "candid": "https://github.com/dfinity/sol-rpc-canister/releases/latest/download/sol_rpc_canister.did",
+      "wasm": "https://github.com/dfinity/sol-rpc-canister/releases/latest/download/sol_rpc_canister.wasm.gz",
+      "init_arg": "( record {} )"
+    },
     "soulboard-icp-frontend": {
       "dependencies": [
         "soulboard-icp-backend"
@@ -14,6 +20,12 @@
       ],
       "type": "assets",
       "workspace": "soulboard-icp-frontend"
+    },
+    "icp_ledger_canister": {
+      "type": "custom",
+      "candid": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-07-04/ledger.did",
+      "wasm": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-07-04/ledger-canister_notify-method.wasm.gz",
+      "init_arg" : "(variant { Init = record { minting_account = \"6a79c585ce9109f31d8e5a5ddd1a5a2bc135cf9f8c263a67f4a49c675c6a44ad\"; initial_values = vec { record { \"6a79c585ce9109f31d8e5a5ddd1a5a2bc135cf9f8c263a67f4a49c675c6a44ad\"; record { e8s = 10_000_000_000 : nat64; }; }; }; send_whitelist = vec {}; transfer_fee = opt record { e8s = 10_000 : nat64; }; token_symbol = opt \"LICP\"; token_name = opt \"Local ICP\"; } })"
     }
   },
   "defaults": {
