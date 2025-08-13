@@ -372,15 +372,18 @@ dependencies = [
 
 [[package]]
 name = "ic-stable-structures"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95dce29e3ceb0e6da3e78b305d95365530f2efd2146ca18590c0ef3aa6038568"
-
-[[package]]
-name = "ic-stable-structures"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d30d4cf17aff1024e13133897048bcba580e063c9000571ab766ca37e2996f4"
+dependencies = [
+ "ic_principal",
+]
+
+[[package]]
+name = "ic-stable-structures"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e54aeb082293c69def5ab34c70593ba85ff000386f7d0eacdf73514daaeca031"
 dependencies = [
  "ic_principal",
 ]
@@ -756,7 +759,7 @@ dependencies = [
  "getrandom 0.2.16",
  "ic-cdk",
  "ic-cdk-timers",
- "ic-stable-structures 0.5.6",
+ "ic-stable-structures 0.7.0",
  "icrc-ledger-types",
  "rand",
  "serde",
@@ -903,7 +906,18 @@ checksum = "f33196643e165781c20a5ead5582283a7dacbb87855d867fbc2df3f81eddc1be"
 dependencies = [
  "getrandom 0.3.3",
  "js-sys",
+ "serde",
+ "uuid-rng-internal",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uuid-rng-internal"
+version = "1.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23bf87b6052a24c8ebbe4a5301be9df955b874cb3a6d2ede0e1b2468dc7d0e65"
+dependencies = [
+ "getrandom 0.3.3",
 ]
 
 [[package]]
