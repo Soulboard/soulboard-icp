@@ -1,18 +1,14 @@
 use std::{cell::RefCell, borrow::Cow};
-use ic_cdk::{init, caller};
-use rand::rngs::StdRng;
+use ic_cdk::{caller, call};
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{DefaultMemoryImpl, StableBTreeMap, Storable, storable::Bound};
 use candid::{CandidType, Deserialize, Encode, Decode, Principal};
+use icrc_ledger_types::icrc1::account::{Account, Subaccount};
 use icrc_ledger_types::icrc1::transfer::{BlockIndex, Memo, NumTokens, TransferArg, TransferError};
 
 type Memory = VirtualMemory<DefaultMemoryImpl>;
-const MAX_VALUE_SIZE: u32 = 500; // Increased size for additional data
+const MAX_VALUE_SIZE: u32 = 100; // Increased size for additional data
 
-#[ic_cdk::query]
-fn greet(name: String) -> String {
-    format!("Hello, {}!", name)
-}
 
 #[derive(CandidType, Deserialize, Clone)]
 struct Provider {
@@ -20,6 +16,7 @@ struct Provider {
     name: String,
     owner: Principal, // Track who owns this provider
     locations: Vec<Location>,
+    total_earnings: NumTokens, // Track total earnings
 }
 
 #[derive(CandidType, Deserialize, Clone)]
@@ -42,6 +39,34 @@ struct Campaign {
     budget: NumTokens,
     owner: Principal, // Track who created this campaign
     status: CampaignStatus,
+}
+
+// New struct to track individual campaign-provider earnings
+#[derive(CandidType, Deserialize, Clone)]
+struct ProviderEarnings {
+    provider_id: String,
+    campaign_id: String,
+    total_earned: NumTokens,
+    last_withdrawal: Option<u64>, // timestamp
+}
+
+impl Storable for ProviderEarnings {
+    fn to_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        Cow::Owned(Encode!(self).unwrap())
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        Encode!(&self).unwrap()
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        Decode!(bytes.as_ref(), Self).unwrap()
+    }
+
+    const BOUND: Bound = Bound::Bounded {
+        max_size: MAX_VALUE_SIZE,
+        is_fixed_size: false,
+    };
 }
 
 #[derive(CandidType, Deserialize, Clone)]
@@ -115,6 +140,13 @@ thread_local! {
         )
     );
 
+    // Maps earnings key (provider_id:campaign_id) to earnings
+    static EARNINGS_REGISTRY: RefCell<StableBTreeMap<String, ProviderEarnings, Memory>> = RefCell::new(
+        StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(2))),
+        )
+    );
+
     // Counter for generating unique IDs
     static CAMPAIGN_COUNTER: RefCell<u64> = RefCell::new(0);
     static PROVIDER_COUNTER: RefCell<u64> = RefCell::new(0);
@@ -149,6 +181,7 @@ fn register_provider(name: String, locations: Vec<Location>) -> Result<String, S
         name,
         owner: caller_principal,
         locations,
+        total_earnings: NumTokens::from(0u64),
     };
 
     PROVIDER_REGISTRY.with(|registry| {
@@ -188,34 +221,236 @@ fn create_campaign(
     Ok(campaign_id)
 }
 
-// Only the campaign owner can fund their campaign
+/// Transfers some ICP to the specified account.
+async fn icp_transfer(
+    from_subaccount: Option<Subaccount>,
+    to: Account,
+    memo: Option<Vec<u8>>,
+    amount: NumTokens,
+) -> Result<BlockIndex, String> {
+    // The ID of the ledger canister on the IC mainnet.
+    const ICP_LEDGER_CANISTER_ID: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+    let icp_ledger = Principal::from_text(ICP_LEDGER_CANISTER_ID).unwrap();
+    let args = TransferArg {
+        // A "memo" is an arbitrary blob that has no meaning to the ledger, but can be used by
+        // the sender or receiver to attach additional information to the transaction.
+        memo: memo.map(|m| Memo::from(m)),
+        to,
+        amount,
+        // The ledger supports subaccounts. You can pick the subaccount of the caller canister's
+        // account to use for transferring the ICP. If you don't specify a subaccount, the default
+        // subaccount of the caller's account is used.
+        from_subaccount,
+        // The ICP ledger canister charges a fee for transfers, which is deducted from the
+        // sender's account. The fee is fixed to 10_000 e8s (0.0001 ICP). You can specify it here,
+        // to ensure that it hasn't changed, or leave it as None to use the current fee.
+        fee: Some(NumTokens::from(10_000u32)),
+        // The created_at_time is used for deduplication. Not set in this example since it uses
+        // unbounded-wait calls. You should, however, set it if you opt to use bounded-wait
+        // calls, or if you use ingress messages, or if you are worried about bugs in the ICP
+        // ledger.
+        created_at_time: None,
+    };
+
+    // Make the inter-canister call to the ICP ledger
+    match call(icp_ledger, "icrc1_transfer", (args,)).await {
+        Ok((result,)) => {
+            let transfer_result: Result<BlockIndex, TransferError> = result;
+            match transfer_result {
+                Ok(block_index) => Ok(block_index),
+                Err(e) => Err(format!("Ledger returned an error: {:?}", e)),
+            }
+        }
+        Err((code, msg)) => Err(format!("Error calling ledger canister: {:?}: {}", code, msg)),
+    }
+}
+
+// Helper function to create an account from a principal
+fn principal_to_account(principal: Principal) -> Account {
+    Account {
+        owner: principal,
+        subaccount: None,
+    }
+}
+
+// Only the campaign owner can fund their campaign with actual ICP transfer
 #[ic_cdk::update]
-fn fund_campaign(campaign_id: String, amount: u64) -> Result<(), String> {
+async fn fund_campaign(campaign_id: String, amount: NumTokens) -> Result<String, String> {
     let caller_principal = caller();
+    let amount_clone = amount.clone();
     
+    // First, verify the campaign exists and the caller is the owner
     CAMPAIGN_REGISTRY.with(|registry| {
-        let mut registry_borrow = registry.borrow_mut();
-        
-        match registry_borrow.get(&campaign_id) {
-            Some(mut campaign) => {
+        match registry.borrow().get(&campaign_id) {
+            Some(campaign) => {
                 if campaign.owner != caller_principal {
                     return Err("Unauthorized: You can only fund your own campaigns".to_string());
                 }
-                
-                campaign.budget += amount;
-                registry_borrow.insert(campaign_id, campaign);
                 Ok(())
             }
             None => Err("Campaign not found".to_string()),
         }
-    })
+    })?;
+
+    // Get this canister's principal as the recipient
+    let canister_principal = ic_cdk::api::id();
+    let canister_account = principal_to_account(canister_principal);
+    
+    // Transfer ICP from the caller to this canister
+    let transfer_memo = format!("Fund campaign: {}", campaign_id).into_bytes();
+    let transfer_amount = amount; // Create a copy for the transfer
+    match icp_transfer(
+        None, // from_subaccount - uses caller's default
+        canister_account, // to - this canister
+        Some(transfer_memo),
+        transfer_amount,
+    ).await {
+        Ok(block_index) => {
+            // If transfer successful, update the campaign budget
+            CAMPAIGN_REGISTRY.with(|registry| {
+                let mut registry_borrow = registry.borrow_mut();
+                if let Some(mut campaign) = registry_borrow.get(&campaign_id) {
+                    campaign.budget += amount_clone;
+                    registry_borrow.insert(campaign_id.clone(), campaign);
+                }
+            });
+            
+            Ok(format!("Campaign funded successfully. Transfer block index: {}", block_index))
+        }
+        Err(e) => Err(format!("Failed to transfer ICP: {}", e)),
+    }
 }
 
-// Only the campaign owner can withdraw funds
+// Provider can withdraw their earnings with actual ICP transfer
 #[ic_cdk::update]
-fn withdraw_funds(campaign_id: String, amount: u64) -> Result<(), String> {
+async fn withdraw_provider_earnings(provider_id: String, amount: NumTokens) -> Result<String, String> {
     let caller_principal = caller();
+    let amount_clone = amount.clone(); // Clone for later use
     
+    // Verify the provider exists and the caller is the owner
+    PROVIDER_REGISTRY.with(|registry| {
+        match registry.borrow().get(&provider_id) {
+            Some(provider) => {
+                if provider.owner != caller_principal {
+                    return Err("Unauthorized: You can only withdraw from your own provider account".to_string());
+                }
+                if provider.total_earnings < amount_clone {
+                    return Err("Insufficient earnings to withdraw".to_string());
+                }
+                Ok(())
+            }
+            None => Err("Provider not found".to_string()),
+        }
+    })?;
+
+    // Create account for the provider owner
+    let provider_account = principal_to_account(caller_principal);
+    
+    // Transfer ICP from this canister to the provider
+    let transfer_memo = format!("Provider withdrawal: {}", provider_id).into_bytes();
+    match icp_transfer(
+        None, // from_subaccount - uses canister's default
+        provider_account, // to - provider's account
+        Some(transfer_memo),
+        amount,
+    ).await {
+        Ok(block_index) => {
+            // If transfer successful, update the provider's earnings
+            PROVIDER_REGISTRY.with(|registry| {
+                let mut registry_borrow = registry.borrow_mut();
+                if let Some(mut provider) = registry_borrow.get(&provider_id) {
+                    provider.total_earnings -= amount_clone;
+                    registry_borrow.insert(provider_id.clone(), provider);
+                }
+            });
+            
+            Ok(format!("Withdrawal successful. Transfer block index: {}", block_index))
+        }
+        Err(e) => Err(format!("Failed to transfer ICP: {}", e)),
+    }
+}
+
+// Function to add earnings to a provider (called when campaign pays provider)
+#[ic_cdk::update]
+async fn pay_provider(campaign_id: String, provider_id: String, amount: NumTokens) -> Result<String, String> {
+    let caller_principal = caller();
+    let amount_clone1 = amount.clone();
+    let amount_clone2 = amount.clone();
+    let amount_clone3 = amount.clone();
+    
+    // Verify the campaign exists and the caller is the owner
+    CAMPAIGN_REGISTRY.with(|registry| {
+        match registry.borrow().get(&campaign_id) {
+            Some(campaign) => {
+                if campaign.owner != caller_principal {
+                    return Err("Unauthorized: You can only pay from your own campaigns".to_string());
+                }
+                if campaign.budget < amount_clone1 {
+                    return Err("Insufficient campaign budget".to_string());
+                }
+                Ok(())
+            }
+            None => Err("Campaign not found".to_string()),
+        }
+    })?;
+
+    // Verify the provider exists
+    PROVIDER_REGISTRY.with(|registry| {
+        match registry.borrow().get(&provider_id) {
+            Some(_) => Ok(()),
+            None => Err("Provider not found".to_string()),
+        }
+    })?;
+
+    // Update campaign budget
+    CAMPAIGN_REGISTRY.with(|registry| {
+        let mut registry_borrow = registry.borrow_mut();
+        if let Some(mut campaign) = registry_borrow.get(&campaign_id) {
+            campaign.budget -= amount_clone2;
+            registry_borrow.insert(campaign_id.clone(), campaign);
+        }
+    });
+
+    // Update provider earnings
+    PROVIDER_REGISTRY.with(|registry| {
+        let mut registry_borrow = registry.borrow_mut();
+        if let Some(mut provider) = registry_borrow.get(&provider_id) {
+            provider.total_earnings += amount_clone3;
+            registry_borrow.insert(provider_id.clone(), provider);
+        }
+    });
+
+    // Update or create earnings record
+    let earnings_key = format!("{}:{}", provider_id, campaign_id);
+    EARNINGS_REGISTRY.with(|registry| {
+        let mut registry_borrow = registry.borrow_mut();
+        match registry_borrow.get(&earnings_key) {
+            Some(mut earnings) => {
+                earnings.total_earned += amount.clone();
+                registry_borrow.insert(earnings_key, earnings);
+            }
+            None => {
+                let new_earnings = ProviderEarnings {
+                    provider_id: provider_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    total_earned: amount.clone(),
+                    last_withdrawal: None,
+                };
+                registry_borrow.insert(earnings_key, new_earnings);
+            }
+        }
+    });
+
+    Ok(format!("Payment of {} tokens made to provider {}", amount, provider_id))
+}
+
+// Only the campaign owner can withdraw funds from their campaign budget (emergency/unused funds)
+#[ic_cdk::update]
+async fn withdraw_campaign_funds(campaign_id: String, amount: NumTokens) -> Result<String, String> {
+    let caller_principal = caller();
+    let amount_clone = amount.clone();
+    
+    // Verify the campaign exists and the caller is the owner, then update budget
     CAMPAIGN_REGISTRY.with(|registry| {
         let mut registry_borrow = registry.borrow_mut();
         
@@ -225,17 +460,44 @@ fn withdraw_funds(campaign_id: String, amount: u64) -> Result<(), String> {
                     return Err("Unauthorized: You can only withdraw from your own campaigns".to_string());
                 }
                 
-                if campaign.budget < amount {
+                if campaign.budget < amount_clone {
                     return Err("Insufficient funds".to_string());
                 }
                 
-                campaign.budget -= amount;
-                registry_borrow.insert(campaign_id, campaign);
+                campaign.budget -= amount_clone.clone();
+                registry_borrow.insert(campaign_id.clone(), campaign);
                 Ok(())
             }
             None => Err("Campaign not found".to_string()),
         }
-    })
+    })?;
+
+    // Create account for the campaign owner
+    let owner_account = principal_to_account(caller_principal);
+    
+    // Transfer ICP from this canister to the campaign owner
+    let transfer_memo = format!("Campaign withdrawal: {}", campaign_id).into_bytes();
+    match icp_transfer(
+        None, // from_subaccount - uses canister's default
+        owner_account, // to - campaign owner's account
+        Some(transfer_memo),
+        amount,
+    ).await {
+        Ok(block_index) => {
+            Ok(format!("Campaign funds withdrawal successful. Transfer block index: {}", block_index))
+        }
+        Err(e) => {
+            // Rollback the budget change if transfer failed
+            CAMPAIGN_REGISTRY.with(|registry| {
+                let mut registry_borrow = registry.borrow_mut();
+                if let Some(mut campaign) = registry_borrow.get(&campaign_id) {
+                    campaign.budget += amount_clone;
+                    registry_borrow.insert(campaign_id, campaign);
+                }
+            });
+            Err(format!("Failed to transfer ICP: {}", e))
+        }
+    }
 }
 
 // Only the campaign owner can close their campaign
@@ -260,12 +522,83 @@ fn close_campaign(campaign_id: String) -> Result<(), String> {
     })
 }
 
-#[ic_cdk::update]
-fn add_provider(campaign_id: String, provider_id: String) -> Result<(), String> {
+// Get provider earnings (only provider owner can see)
+#[ic_cdk::query]
+fn get_provider_earnings(provider_id: String) -> Result<NumTokens, String> {
+    let caller_principal = caller();
+    
+    PROVIDER_REGISTRY.with(|registry| {
+        match registry.borrow().get(&provider_id) {
+            Some(provider) => {
+                if provider.owner != caller_principal {
+                    return Err("Unauthorized: You can only view your own provider earnings".to_string());
+                }
+                Ok(provider.total_earnings)
+            }
+            None => Err("Provider not found".to_string()),
+        }
+    })
+}
+
+// Get detailed earnings breakdown for a provider
+#[ic_cdk::query]
+fn get_provider_earnings_breakdown(provider_id: String) -> Result<Vec<ProviderEarnings>, String> {
+    let caller_principal = caller();
+    
+    // Verify provider ownership
+    PROVIDER_REGISTRY.with(|registry| {
+        match registry.borrow().get(&provider_id) {
+            Some(provider) => {
+                if provider.owner != caller_principal {
+                    return Err("Unauthorized: You can only view your own provider earnings".to_string());
+                }
+                Ok(())
+            }
+            None => return Err("Provider not found".to_string()),
+        }
+    })?;
+
+    // Get all earnings for this provider
+    EARNINGS_REGISTRY.with(|registry| {
+        Ok(registry
+            .borrow()
+            .iter()
+            .filter_map(|entry| {
+                let earnings = entry.value();
+                if earnings.provider_id == provider_id {
+                    Some(earnings)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    })
+}
+
+// Get campaign balance (only campaign owner can see)
+#[ic_cdk::query]
+fn get_campaign_balance(campaign_id: String) -> Result<NumTokens, String> {
     let caller_principal = caller();
     
     CAMPAIGN_REGISTRY.with(|registry| {
-        let mut registry_borrow = registry.borrow_mut();
+        match registry.borrow().get(&campaign_id) {
+            Some(campaign) => {
+                if campaign.owner != caller_principal {
+                    return Err("Unauthorized: You can only view your own campaign balance".to_string());
+                }
+                Ok(campaign.budget)
+            }
+            None => Err("Campaign not found".to_string()),
+        }
+    })
+}
+
+#[ic_cdk::update]
+fn add_provider(campaign_id: String, _provider_id: String) -> Result<(), String> {
+    let caller_principal = caller();
+    
+    CAMPAIGN_REGISTRY.with(|registry| {
+        let registry_borrow = registry.borrow();
         
         match registry_borrow.get(&campaign_id) {
             Some(campaign) => {
@@ -285,11 +618,11 @@ fn add_provider(campaign_id: String, provider_id: String) -> Result<(), String> 
 }
 
 #[ic_cdk::update]
-fn remove_provider(campaign_id: String, provider_id: String) -> Result<(), String> {
+fn remove_provider(campaign_id: String, _provider_id: String) -> Result<(), String> {
     let caller_principal = caller();
     
     CAMPAIGN_REGISTRY.with(|registry| {
-        let mut registry_borrow = registry.borrow_mut();
+        let registry_borrow = registry.borrow();
         
         match registry_borrow.get(&campaign_id) {
             Some(campaign) => {
@@ -388,3 +721,8 @@ fn get_providers_for_campaign(campaign_id: String) -> Result<Vec<Provider>, Stri
         }
     })
 }
+
+
+
+ic_cdk::export_candid!();
+
